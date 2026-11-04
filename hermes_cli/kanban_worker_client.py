@@ -94,7 +94,8 @@ async def run(params, board_db):
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
+                raise _owner_transient(GatewayClientError(
+                    f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}')) from exc
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
@@ -144,10 +145,18 @@ async def _await_receipt(client, params, board_db, claim):
     return receipt
 
 
+def _owner_transient(exc):
+    """Tag the client error that ends an attempt the gateway owner lost (``_submit`` books exit 76 for
+    a tagged error and exit 1 for every other one): the exit is decided where the transient state is
+    known, never by reading the message."""
+    exc.owner_transient = True
+    return exc
+
+
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
+        raise _owner_transient(GatewayClientError('Kanban execution unknown; retained by owner'))
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
@@ -186,6 +195,12 @@ def _submit():
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
     except (KeyError, ValueError, OSError) as exc:
+        # Exit 76 only for an owner-transient end (the tag set above); a refused owner, a missing
+        # environment or any other client error stays the refusal exit 1.
+        if getattr(exc, 'owner_transient', False):
+            from hermes_cli.kanban_db import KANBAN_OWNER_TRANSIENT_EXIT_CODE
+            print(f'Kanban owner transient: {exc}', file=sys.stderr)
+            return KANBAN_OWNER_TRANSIENT_EXIT_CODE
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
 

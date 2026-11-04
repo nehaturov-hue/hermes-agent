@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the owner-transient exit code (76) and its why-comment, beside the other worker exit codes this module owns; that constant is the whole line growth (the event-kind lists change in place)
 """SQLite-backed Kanban board shared across profiles (the cross-profile coordination primitive).
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
@@ -234,7 +235,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "timed_out", "auto_blocked", "rate_limited", "owner_transient", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
@@ -313,6 +314,12 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # (404), TLS chain broken — a retry cannot fix it, so the dispatcher parks the card blocked on
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
+
+# Worker exit "the gateway owner lost this attempt" (a stall or a restart that outlasted the owner's
+# silence budget, or a receipt that reads ``unknown``): a harness failure, not a work failure, so the
+# dispatcher requeues it as ``owner_transient`` without counting it, for a bounded streak. 76 == BSD
+# EX_PROTOCOL; 75 is EX_TEMPFAIL and 78 EX_CONFIG. Nothing else in hermes_cli/ or gateway/ exits 76.
+KANBAN_OWNER_TRANSIENT_EXIT_CODE = 76
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -2023,7 +2030,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'owner_transient'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))

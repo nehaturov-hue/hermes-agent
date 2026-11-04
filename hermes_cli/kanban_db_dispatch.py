@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- owner-transient exit accounting (exit 76): its branches sit in the functions that already own the crash accounting and the breaker they must bypass (_classify_dead_worker_exit, _reclaim_dead_workers, check_respawn_guard), so moving them out would split one decision across modules; the file is over target from before this change (main: 2964 lines) and its decomposition is a separate change
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -75,6 +76,10 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # wall, burning a worker slot every tick for hours. Overridable via
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+# Owner-transient exits (exit 76, the gateway owner lost the attempt): consecutive free retries a card
+# may take (0 switches the class off), and the seconds it waits after one before it is respawned.
+DEFAULT_OWNER_TRANSIENT_LIMIT = 6
+DEFAULT_OWNER_TRANSIENT_COOLDOWN_SECONDS = 60
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -142,6 +147,9 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    owner_transient: list[str] = field(default_factory=list)
+    """Task ids whose worker lost its gateway owner (exit ``KANBAN_OWNER_TRANSIENT_EXIT_CODE``) and were
+    released to their source phase WITHOUT counting a failure, within ``kanban.owner_transient_limit``."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -170,6 +178,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.owner_transient:
+            counts["owner_transient"] = counts.get("owner_transient", 0) + len(res.owner_transient)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -223,8 +233,9 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
 def _classify_worker_exit(pid: int) -> tuple[str, Optional[int]]:
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
-    (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
-    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
+    (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure), ``owner_transient``
+    (``KANBAN_OWNER_TRANSIENT_EXIT_CODE``: the gateway owner lost the attempt; see
+    ``_classify_dead_worker_exit``), ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
     not in the reap registry; ``code`` None)."""
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -249,6 +260,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("clean_exit", 0)
     if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
         return ("rate_limited", code)
+    if code == _kb.KANBAN_OWNER_TRANSIENT_EXIT_CODE:
+        return ("owner_transient", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
     return ("nonzero_exit", code)
@@ -943,8 +956,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
+    just closed). ``rate_limited`` and ``owner_transient`` runs are neutral and
+    skipped (a quota wall or a gateway stall says nothing about the task); any
+    other closed run breaks the streak, so
     the budget counts ONLY protocol violations. Violations are recognized by the
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
@@ -958,7 +972,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "owner_transient"):
             continue
         head = (row["error"] or "").partition(WORKER_OUTPUT_SEP)[0]  # never the worker's own words
         if outcome == "crashed" and (
@@ -966,6 +980,21 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
             streak += 1
             continue
         break
+    return streak
+
+
+def _owner_transient_streak(conn: sqlite3.Connection, task_id: str, cap: int) -> int:
+    """Consecutive ended runs of the task, newest first, that ended ``owner_transient``: the free
+    streak so far. Any other closed run (a completed one included) breaks it. Scans at most ``cap``
+    runs: a caller that only needs to know whether the streak passed its limit passes ``limit + 1``."""
+    streak = 0
+    for row in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?", (task_id, cap),
+    ):
+        if row["outcome"] != "owner_transient":
+            break
+        streak += 1
     return streak
 
 
@@ -1050,16 +1079,22 @@ class _DeadWorker:
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
 
+    owner_transient: bool = False
+    """``KANBAN_OWNER_TRANSIENT_EXIT_CODE`` inside the free streak: the gateway owner lost the attempt.
+    Requeued to its source phase; never counted as a failure."""
+
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; an owner-transient one as ``owner_transient``.
+        if self.owner_transient:
+            return "owner_transient"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
-    board: Optional[str] = None,
+    board: Optional[str] = None, owner_transient_streak: Optional[int] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1067,7 +1102,8 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
+    dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board,
+                                      owner_transient_streak=owner_transient_streak)
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1083,6 +1119,7 @@ def _classify_dead_worker_exit(
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
+    owner_transient_streak: Optional[int] = None,
 ) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
 
@@ -1100,6 +1137,23 @@ def _classify_dead_worker_exit(
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
+    # The gateway owner lost this attempt (a stall or a restart): a harness failure. Free while the
+    # streak is within ``kanban.owner_transient_limit``; past it, or with the class switched off
+    # (limit 0), the exit is an ordinary crash, booked as one.
+    streak = owner_transient_streak or 1
+    owner_transient_exhausted = False
+    if kind == "owner_transient":
+        limit = owner_transient_limit()
+        if limit > 0 and streak <= limit:
+            return _DeadWorker(
+                kind, code,
+                f"pid {pid} lost its gateway owner (exit {code}); requeued without counting a failure",
+                "owner_transient",
+                {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "streak": streak},
+                owner_transient=True,
+            )
+        kind = "nonzero_exit"
+        owner_transient_exhausted = limit > 0
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
@@ -1144,6 +1198,9 @@ def _classify_dead_worker_exit(
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
         event_payload["exit_code"] = code
+    if owner_transient_exhausted:
+        event_payload["owner_transient_exhausted"] = True
+        event_payload["streak"] = streak
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
@@ -1153,6 +1210,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    owner_transient: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1191,7 +1249,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            streak = _owner_transient_streak(conn, row["id"], owner_transient_limit() + 1) + 1
+            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board,
+                                         owner_transient_streak=streak)
             apply_attempt_note(conn, row["id"], pid, dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
@@ -1233,6 +1293,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.owner_transient:
+                sweep.owner_transient.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1337,6 +1399,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_owner_transient = sweep.owner_transient  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1553,12 +1616,42 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _kanban_config_int(key: str, default: int) -> int:
+    """``kanban.<key>`` from config as a non-negative integer; ``default`` when unset or invalid."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = ((load_config_readonly() or {}).get("kanban") or {}).get(key)
+    except Exception:  # health: allow BLE001 -- a config read must never fail a dispatch tick: the config loader itself falls back to defaults on an unreadable file, and this boundary does the same
+        return default
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def owner_transient_limit() -> int:
+    """``kanban.owner_transient_limit``: consecutive owner-transient exits a card may take without
+    counting a failure. ``0`` switches the class off (an exit 76 then counts as a crash, as before)."""
+    return _kanban_config_int("owner_transient_limit", DEFAULT_OWNER_TRANSIENT_LIMIT)
+
+
+def owner_transient_cooldown_seconds() -> int:
+    """``kanban.owner_transient_cooldown_seconds``: seconds a card waits after an owner-transient exit
+    before it is respawned (``0``: no wait)."""
+    return _kanban_config_int("owner_transient_cooldown_seconds", DEFAULT_OWNER_TRANSIENT_COOLDOWN_SECONDS)
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review row before any claim attempt. Priority order:
+    ``"owner_transient_cooldown"`` (latest run ``owner_transient``: the gateway owner lost the attempt,
+    within ``kanban.owner_transient_cooldown_seconds`` of its end; never counted; once it passes, the
+    guards below apply as after a crash, except the text blocker),
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
@@ -1613,13 +1706,24 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
+    # 1b. Owner-transient cooldown, the rate-limit shape on its own config: the gateway owner lost the
+    #     attempt (the host's condition, not the card's). Decided by the typed outcome, never by text.
+    #     Only the wait is the rate-limit shape: once it has passed, the duplicate-work guards below apply
+    #     as after a crash (an open PR is not re-spawned against).
+    ot_cooldown = owner_transient_cooldown_seconds()
+    if latest_run is not None and latest_run["outcome"] == "owner_transient" and ot_cooldown > 0:
+        ended_at = _kb._to_epoch(latest_run["ended_at"])
+        if ended_at is not None and (now - ended_at) < ot_cooldown:
+            return "owner_transient_cooldown"
+
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # benign commands such as ``claude auth status`` (#117097).  An owner-transient
+    # exit's error is the stall's text, not a diagnosis either.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome not in ("crashed", "owner_transient") and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -2228,6 +2332,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.owner_transient.extend(getattr(detect_crashed_workers, "_last_owner_transient", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

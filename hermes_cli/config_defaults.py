@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- two kanban defaults (owner_transient_limit, owner_transient_cooldown_seconds) and their why-comments; DEFAULT_CONFIG is the one place config defaults live, and its comments are the config.yaml docs
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
@@ -1885,6 +1886,11 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Owner-transient exits (exit 76: the gateway owner stalled or restarted under the worker) never
+        # count toward failure_limit. A card takes this many consecutive ones free, then the next counts
+        # as an ordinary crash (0 switches the class off). Each one waits the cooldown (seconds) first.
+        "owner_transient_limit": 6,
+        "owner_transient_cooldown_seconds": 60,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
